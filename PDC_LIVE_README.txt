@@ -39,6 +39,26 @@ SETUP
 5. Run:
    python pdc_live_performance_visualizer.py
 
+OPTIONAL DISTRIBUTED MODE WITH GROUP LAPTOPS
+--------------------------------------------
+The laptop running `pdc_live_performance_visualizer.py` acts as the master.
+Each additional laptop acts as a worker and must be on the same Wi-Fi/LAN.
+
+1. Copy `distributed_worker.py` to each worker laptop.
+2. Install Python 3 on each worker laptop.
+3. Start a worker on each laptop:
+   python distributed_worker.py --host 0.0.0.0 --port 5050 --name Worker-1
+   Use a different name for the second laptop, such as Worker-2.
+4. Allow TCP port 5050 through Windows Firewall when prompted.
+5. Find each worker laptop's private IPv4 address with `ipconfig`.
+6. On the master dashboard, open the `PDC Tests` tab.
+7. Enter addresses such as `192.168.1.101:5050, 192.168.1.102:5050`.
+8. Click `Connect Workers`, then click `Run Distributed Test`.
+
+The master divides the prime-number workload across the connected workers and
+shows distributed speedup and efficiency. The master coordinates the test but
+does not participate as a worker in this mode.
+
 HOW TO DEMONSTRATE WITH PHOTOSHOP
 ---------------------------------
 1. Open Photoshop.

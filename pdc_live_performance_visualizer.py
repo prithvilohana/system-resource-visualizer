@@ -2,9 +2,11 @@ import os
 import math
 import time
 import queue
+import json
+import socket
 import threading
 import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from collections import deque
 
 import psutil
@@ -72,6 +74,59 @@ def run_prime_benchmark(workers, workload):
 
     with ProcessPoolExecutor(max_workers=workers) as executor:
         results = list(executor.map(count_primes_range, ranges))
+
+    elapsed = time.perf_counter() - start
+    return elapsed, sum(results)
+
+
+def request_worker(host, port, payload, timeout=120):
+    with socket.create_connection((host, port), timeout=timeout) as connection:
+        connection.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+        response = connection.makefile("rb").readline()
+
+    if not response:
+        raise ConnectionError(f"Worker {host}:{port} closed the connection")
+
+    result = json.loads(response.decode("utf-8"))
+    if not result.get("ok"):
+        raise RuntimeError(result.get("error", "Unknown worker error"))
+    return result
+
+
+def check_distributed_workers(workers):
+    with ThreadPoolExecutor(max_workers=len(workers)) as executor:
+        futures = {
+            executor.submit(request_worker, host, port, {"command": "hello"}): (host, port)
+            for host, port in workers
+        }
+        results = []
+        for future in as_completed(futures):
+            host, port = futures[future]
+            response = future.result()
+            results.append({
+                "host": host,
+                "port": port,
+                "name": response.get("name", f"{host}:{port}"),
+                "logical_cpus": response.get("logical_cpus", "N/A"),
+            })
+    return sorted(results, key=lambda item: item["name"].lower())
+
+
+def run_distributed_prime_benchmark(workers, workload):
+    ranges = split_range(workload, len(workers))
+    start = time.perf_counter()
+
+    with ThreadPoolExecutor(max_workers=len(workers)) as executor:
+        futures = [
+            executor.submit(
+                request_worker,
+                host,
+                port,
+                {"command": "prime_range", "start": range_start, "end": range_end},
+            )
+            for (host, port), (range_start, range_end) in zip(workers, ranges)
+        ]
+        results = [future.result()["count"] for future in futures]
 
     elapsed = time.perf_counter() - start
     return elapsed, sum(results)
@@ -230,6 +285,7 @@ class PerformanceVisualizer(tk.Tk):
         self.communication_latencies = []
         self.selected_process_failures = 0
         self.selected_process_display = ""
+        self.distributed_workers = []
 
         self.system_bus_running = True
         self.system_bus_phase = 0.0
@@ -421,6 +477,33 @@ class PerformanceVisualizer(tk.Tk):
             controls,
             text="Run these tests while watching the Live Monitor tab to see CPU graphs move in real time.",
         ).pack(side="left", padx=12)
+
+        distributed = ttk.LabelFrame(
+            self.tests_tab,
+            text="Distributed Workers (run distributed_worker.py on other laptops)",
+            padding=8,
+        )
+        distributed.pack(fill="x", padx=15, pady=(0, 6))
+
+        ttk.Label(distributed, text="Worker addresses:").pack(side="left")
+        self.worker_addresses_var = tk.StringVar(value="192.168.1.101:5050, 192.168.1.102:5050")
+        ttk.Entry(distributed, textvariable=self.worker_addresses_var, width=48).pack(
+            side="left", padx=6
+        )
+        self.connect_workers_button = ttk.Button(
+            distributed,
+            text="Connect Workers",
+            command=self.start_worker_connection,
+        )
+        self.connect_workers_button.pack(side="left", padx=4)
+        self.distributed_button = ttk.Button(
+            distributed,
+            text="Run Distributed Test",
+            command=self.start_distributed_test,
+        )
+        self.distributed_button.pack(side="left", padx=4)
+        self.worker_status_var = tk.StringVar(value="No distributed workers connected")
+        ttk.Label(distributed, textvariable=self.worker_status_var).pack(side="left", padx=8)
 
         middle = ttk.Frame(self.tests_tab, padding=(10, 0, 10, 6))
         middle.pack(fill="x", expand=False)
@@ -824,6 +907,116 @@ class PerformanceVisualizer(tk.Tk):
             daemon=True,
         ).start()
 
+    def _parse_worker_addresses(self):
+        workers = []
+        for address in self.worker_addresses_var.get().split(","):
+            address = address.strip()
+            if not address:
+                continue
+            if ":" in address:
+                host, port_text = address.rsplit(":", 1)
+                port = int(port_text)
+            else:
+                host, port = address, 5050
+            if not host or not 1 <= port <= 65535:
+                raise ValueError(f"Invalid worker address: {address}")
+            workers.append((host, port))
+
+        if not workers:
+            raise ValueError("Enter at least one worker address")
+        return workers
+
+    def start_worker_connection(self):
+        if self.test_running:
+            messagebox.showinfo("Test Running", "Wait for the current PDC test to finish.")
+            return
+
+        try:
+            workers = self._parse_worker_addresses()
+        except ValueError as exc:
+            messagebox.showerror("Invalid Workers", str(exc))
+            return
+
+        self.connect_workers_button.config(state="disabled")
+        self.worker_status_var.set("Connecting...")
+        threading.Thread(
+            target=self._worker_connection_thread,
+            args=(workers,),
+            daemon=True,
+        ).start()
+
+    def _worker_connection_thread(self, workers):
+        try:
+            connected = check_distributed_workers(workers)
+            self.event_queue.put(("workers_connected", connected))
+        except Exception as exc:
+            self.event_queue.put(("workers_error", f"Worker connection failed: {exc}"))
+
+    def start_distributed_test(self):
+        if self.test_running:
+            messagebox.showinfo("Test Running", "Another PDC test is already running.")
+            return
+        if not self.distributed_workers:
+            messagebox.showinfo("No Workers", "Connect at least one distributed worker first.")
+            return
+
+        try:
+            workload = int(self.workload_var.get().replace(",", "").strip())
+            if workload < 50_000:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(
+                "Invalid Workload",
+                "Enter an integer workload of at least 50000.",
+            )
+            return
+
+        self.test_running = True
+        self._set_test_buttons(False)
+        self.status_var.set("Distributed scalability test running")
+        self._log("Starting distributed scalability test...")
+        self.benchmark_workers = []
+        self.benchmark_times = []
+        self.benchmark_speedups = []
+        self.benchmark_efficiencies = []
+        self._refresh_benchmark_charts()
+
+        threading.Thread(
+            target=self._distributed_thread,
+            args=(workload, list(self.distributed_workers)),
+            daemon=True,
+        ).start()
+
+    def _distributed_thread(self, workload, workers):
+        try:
+            baseline = None
+            for worker_count in range(1, len(workers) + 1):
+                selected_workers = workers[:worker_count]
+                self.event_queue.put(
+                    ("log", f"Running distributed benchmark with {worker_count} worker(s)...")
+                )
+                elapsed, prime_count = run_distributed_prime_benchmark(
+                    selected_workers, workload
+                )
+                if baseline is None:
+                    baseline = elapsed
+                speedup = baseline / elapsed if elapsed > 0 else 0
+                efficiency = (speedup / worker_count) * 100 if worker_count else 0
+                self.event_queue.put((
+                    "benchmark_point",
+                    {
+                        "workers": worker_count,
+                        "time": elapsed,
+                        "speedup": speedup,
+                        "efficiency": efficiency,
+                        "primes": prime_count,
+                        "mode": "distributed",
+                    },
+                ))
+            self.event_queue.put(("done", "Distributed scalability test completed."))
+        except Exception as exc:
+            self.event_queue.put(("error", f"Distributed test failed: {exc}"))
+
     def _scalability_thread(self, workload):
         try:
             baseline = None
@@ -907,14 +1100,32 @@ class PerformanceVisualizer(tk.Tk):
                 if event == "log":
                     self._log(payload)
 
+                elif event == "workers_connected":
+                    self.distributed_workers = [
+                        (item["host"], item["port"]) for item in payload
+                    ]
+                    self.connect_workers_button.config(state="normal")
+                    names = ", ".join(
+                        f'{item["name"]} ({item["logical_cpus"]} CPUs)' for item in payload
+                    )
+                    self.worker_status_var.set(f"Connected: {names}")
+                    self._log(f"Connected distributed workers: {names}")
+
+                elif event == "workers_error":
+                    self.connect_workers_button.config(state="normal")
+                    self.worker_status_var.set("Worker connection failed")
+                    self._log(payload)
+                    messagebox.showerror("Worker Connection", payload)
+
                 elif event == "benchmark_point":
                     self.benchmark_workers.append(payload["workers"])
                     self.benchmark_times.append(payload["time"])
                     self.benchmark_speedups.append(payload["speedup"])
                     self.benchmark_efficiencies.append(payload["efficiency"])
 
+                    mode = "Distributed workers" if payload.get("mode") == "distributed" else "Local workers"
                     self._log(
-                        f'Workers={payload["workers"]} | '
+                        f'{mode}={payload["workers"]} | '
                         f'Time={payload["time"]:.3f}s | '
                         f'Speedup={payload["speedup"]:.2f}x | '
                         f'Efficiency={payload["efficiency"]:.1f}% | '
@@ -1020,6 +1231,7 @@ class PerformanceVisualizer(tk.Tk):
         self.benchmark_button.config(state=state)
         self.communication_button.config(state=state)
         self.fault_button.config(state=state)
+        self.distributed_button.config(state=state)
 
     def destroy(self):
         self.monitoring = False
